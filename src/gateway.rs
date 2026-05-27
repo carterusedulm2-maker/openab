@@ -195,7 +195,12 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS),
+                rx,
+            )
+            .await
+            {
                 Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
                 Ok(Ok(_resp)) => {
                     tracing::warn!(request_id = %id, "gateway replied with failure");
@@ -395,7 +400,8 @@ impl ChatAdapter for GatewayAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id))
+            .await
     }
 
     async fn create_thread(
@@ -545,7 +551,7 @@ pub async fn run_gateway_adapter(
     let platform: &'static str = Box::leak(params.platform.into_boxed_str());
 
     // Append auth token as query param if configured
-    let gateway_url = params.url;
+    let gateway_url = normalize_gateway_url(&params.url);
     let bot_username = params.bot_username;
     let allow_all_channels = params.allow_all_channels;
     let allowed_channels = params.allowed_channels;
@@ -554,16 +560,9 @@ pub async fn run_gateway_adapter(
     let streaming = params.streaming;
     let stt_config = params.stt;
 
-    let connect_url = match &params.token {
-        Some(token) => {
-            let sep = if gateway_url.contains('?') { "&" } else { "?" };
-            format!("{gateway_url}{sep}token={token}")
-        }
-        None => {
-            warn!("gateway.token not set — WebSocket connection is NOT authenticated");
-            gateway_url.clone()
-        }
-    };
+    if params.token.is_none() {
+        warn!("gateway.token not set — WebSocket connection is NOT authenticated");
+    }
     let mut backoff_secs = 1u64;
     const MAX_BACKOFF: u64 = 30;
 
@@ -576,7 +575,20 @@ pub async fn run_gateway_adapter(
 
         info!(url = %gateway_url, "connecting to custom gateway");
 
-        let ws_stream = match tokio_tungstenite::connect_async(&connect_url).await {
+        let request = match build_gateway_request(&gateway_url, params.token.as_deref()) {
+            Ok(req) => req,
+            Err(e) => {
+                error!(err = %e, backoff = backoff_secs, "failed to build gateway request, retrying");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    _ = shutdown_rx.changed() => { return Ok(()); }
+                }
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+
+        let ws_stream = match tokio_tungstenite::connect_async(request).await {
             Ok((stream, _)) => {
                 backoff_secs = 1; // reset on success
                 info!("connected to gateway");
@@ -905,4 +917,144 @@ pub async fn run_gateway_adapter(
         }
         backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF);
     } // outer reconnect loop
+}
+
+/// Normalizes a gateway URL by ensuring it has the required WSS endpoint path,
+/// while preserving explicit paths and query parameters.
+fn normalize_gateway_url(raw_url: &str) -> String {
+    if let Ok(mut parsed) = reqwest::Url::parse(raw_url) {
+        if parsed.path() == "/" || parsed.path().is_empty() {
+            parsed.set_path("/v1/openab/ws");
+        }
+        parsed.to_string()
+    } else {
+        raw_url.to_string()
+    }
+}
+
+/// Builds a WebSocket connection request for the gateway.
+/// - For V1 API (/v1/openab/ws), uses Authorization: Bearer <token>
+/// - For legacy APIs, appends ?token=<token>
+fn build_gateway_request(
+    url: &str,
+    token: Option<&str>,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let is_v1 = reqwest::Url::parse(url)
+        .map(|parsed| parsed.path() == "/v1/openab/ws")
+        .unwrap_or(false);
+
+    if let Some(token) = token {
+        if is_v1 {
+            let mut req = url.into_client_request()?;
+            let header_value = tokio_tungstenite::tungstenite::http::header::HeaderValue::from_str(
+                &format!("Bearer {}", token),
+            )
+            .map_err(|_| anyhow::anyhow!("Invalid token format"))?;
+            let header_name = tokio_tungstenite::tungstenite::http::header::HeaderName::from_static(
+                "authorization",
+            );
+            req.headers_mut().insert(header_name, header_value);
+            Ok(req)
+        } else {
+            let sep = if url.contains('?') { "&" } else { "?" };
+            let connect_url = format!("{url}{sep}token={token}");
+            Ok(connect_url.into_client_request()?)
+        }
+    } else {
+        Ok(url.into_client_request()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_gateway_url_root() {
+        assert_eq!(
+            normalize_gateway_url("wss://example.com"),
+            "wss://example.com/v1/openab/ws"
+        );
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/"),
+            "wss://example.com/v1/openab/ws"
+        );
+    }
+
+    #[test]
+    fn test_normalize_gateway_url_already_correct() {
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/v1/openab/ws"),
+            "wss://example.com/v1/openab/ws"
+        );
+    }
+
+    #[test]
+    fn test_normalize_gateway_url_legacy_ws() {
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/ws"),
+            "wss://example.com/ws"
+        );
+    }
+
+    #[test]
+    fn test_normalize_gateway_url_query_params() {
+        assert_eq!(
+            normalize_gateway_url("wss://example.com?foo=bar"),
+            "wss://example.com/v1/openab/ws?foo=bar"
+        );
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/?foo=bar"),
+            "wss://example.com/v1/openab/ws?foo=bar"
+        );
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/ws?foo=bar"),
+            "wss://example.com/ws?foo=bar"
+        );
+        assert_eq!(
+            normalize_gateway_url("wss://example.com/v1/openab/ws?foo=bar"),
+            "wss://example.com/v1/openab/ws?foo=bar"
+        );
+    }
+
+    #[test]
+    fn test_build_gateway_request_v1() {
+        let req = build_gateway_request("wss://example.com/v1/openab/ws", Some("secret")).unwrap();
+        assert_eq!(req.uri().to_string(), "wss://example.com/v1/openab/ws");
+        assert_eq!(
+            req.headers()
+                .get("authorization")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer secret"
+        );
+    }
+
+    #[test]
+    fn test_build_gateway_request_legacy() {
+        let req = build_gateway_request("wss://example.com/ws", Some("secret")).unwrap();
+        assert_eq!(req.uri().to_string(), "wss://example.com/ws?token=secret");
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn test_build_gateway_request_false_positive_query() {
+        let req = build_gateway_request("wss://example.com/ws?fake=/v1/openab/ws", Some("secret"))
+            .unwrap();
+        assert_eq!(
+            req.uri().to_string(),
+            "wss://example.com/ws?fake=/v1/openab/ws&token=secret"
+        );
+        assert!(req.headers().get("authorization").is_none());
+    }
+
+    #[test]
+    fn test_build_gateway_request_no_token() {
+        let req = build_gateway_request("wss://example.com/v1/openab/ws", None).unwrap();
+        assert_eq!(req.uri().to_string(), "wss://example.com/v1/openab/ws");
+        assert!(req.headers().get("authorization").is_none());
+    }
 }
